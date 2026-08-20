@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
+from pynput.keyboard import Key, Controller
 
 import requests
 
@@ -89,7 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def riot_get(session: requests.Session, url: str) -> requests.Response:
-    response = session.get(url, timeout=15)
+    try:
+        response = session.get(url, timeout=15)
+    except requests.exceptions.ConnectionError as e:
+        print(f"Connection failed permanently: {e}")
+        return None
     return response
 
 
@@ -267,6 +272,30 @@ def get_player_hotkey(session: requests.Session, target_selection_name: str) -> 
         
     return None, None
 
+def apply_runes_tab() -> None:
+    keyboard = Controller()
+
+    # AppleScript to target the correct process
+    applescript = """
+    osascript -e '
+    tell application "System Events"
+        set procList to name of every process
+        if procList contains "LeagueofLegends" then
+            set frontmost of process "LeagueofLegends" to true
+        else if procList contains "League of Legends" then
+            set frontmost of process "League of Legends" to true
+        end if
+    end tell'
+    """
+    os.system(applescript)
+    time.sleep(1.0) # Let the window focus fully
+    
+    # Inside your function where you want to press 'q':
+    keyboard.press("c")
+    time.sleep(0.1)
+    keyboard.release("c")
+
+
 def apply_scoreboard(session: requests.Session) -> None:
     """
     Adds the scoreboard to the UI.
@@ -432,6 +461,32 @@ def wait_for_recording_to_finish(session: requests.Session, output_path: Path, t
 
     raise TimeoutError(f"Timed out waiting for recording to finish. Last state: {last_state}")
 
+def wait_for_match_to_begin(session: requests.Session, headers: dict, spectator_url: str, wait_for_match: str):
+    # wait for a match if 
+    while True:
+        spec_res = riot_get(session, spectator_url)
+        if spec_res is None:
+            session = requests.Session()
+            session.headers.update(headers)
+        elif spec_res.status_code == 404:
+            print("Player is not in a live game.")
+            # Dont wait if not explicitly set
+            if not wait_for_match:
+                break
+            print("Waiting...")
+            time.sleep(10)
+        elif spec_res.status_code != 200:
+            print(
+                f"Spectator lookup failed: {spec_res.status_code}\n"
+                f"{spec_res.text.strip()}"
+            )
+            sys.exit(1)
+        elif spec_res.status_code == 200:
+            print("Found a match.")
+            break
+
+    return spec_res
+
 
 def get_match_data(
     game_name: str,
@@ -495,25 +550,10 @@ def get_match_data(
     print(f"Summoner ID: {summoner_id}")
 
     spectator_url = f"https://{platform}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/{quote(summoner_id)}"
-    while True:
-        spec_res = riot_get(session, spectator_url)
-        if spec_res.status_code == 404:
-            print("Player is not in a live game.")
-            # Dont wait if not explicitly set
-            if not wait_for_match:
-                return
-            print("Waiting...")
-            time.sleep(10)
-        elif spec_res.status_code != 200:
-            print(
-                f"Spectator lookup failed: {spec_res.status_code}\n"
-                f"{spec_res.text.strip()}"
-            )
-            sys.exit(1)
-        elif spec_res.status_code == 200:
-            print("Found a match.")
-            break
-
+    spec_res = wait_for_match_to_begin(session, headers, spectator_url, wait_for_match)
+    if not hasattr(spec_res, "status_code") or spec_res.status_code != 200:
+        print("Didn't find a match, exit.")
+        return
     game_data = spec_res.json()
     print_json("Live game payload:", game_data)
 
@@ -572,6 +612,7 @@ def get_match_data(
         )
     else:
         print("Could not find a matching participant to lock the camera to.")
+    apply_runes_tab()
 
     if not record:
         return

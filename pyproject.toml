@@ -10,7 +10,8 @@ dependencies = [
     "opgg-py (>=3.1.0,<4.0.0)",
     "playwright (>=1.62.0,<2.0.0)",
     "requests (>=2.34.2,<3.0.0)",
-    "pyautogui (>=0.9.54,<0.10.0)"
+    "pyautogui (>=0.9.54,<0.10.0)",
+    "pynput (>=1.8.2,<2.0.0)"
 ]
 
 [build-system]
