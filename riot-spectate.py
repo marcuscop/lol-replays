@@ -95,6 +95,9 @@ def riot_get(session: requests.Session, url: str) -> requests.Response:
     except requests.exceptions.ConnectionError as e:
         print(f"Connection failed permanently: {e}")
         return None
+    except requests.exceptions.ReadTimeout as e:
+        print(f"Read timed out.")
+        return None
     return response
 
 
@@ -434,7 +437,10 @@ def start_recording(session: requests.Session, output_path: Path) -> None:
 def is_playback_finished(session: requests.Session) -> bool:
     response_json = local_api_get(session, "/replay/playback").json()
     # if match time is near total playback length
-    if abs(response_json["length"] - response_json["time"]) < 2:
+    end_time = response_json["length"]
+    game_time = response_json["time"]
+    if abs(end_time - game_time) < 2:
+        print(f"Game Length: {end_time}, Game Time: {game_time}")
         return True
     return False
 
@@ -480,7 +486,7 @@ def wait_for_match_to_begin(session: requests.Session, headers: dict, spectator_
                 f"Spectator lookup failed: {spec_res.status_code}\n"
                 f"{spec_res.text.strip()}"
             )
-            sys.exit(1)
+            time.sleep(30)
         elif spec_res.status_code == 200:
             print("Found a match.")
             break
