@@ -439,7 +439,8 @@ def is_playback_finished(session: requests.Session) -> bool:
     # if match time is near total playback length
     end_time = response_json["length"]
     game_time = response_json["time"]
-    if abs(end_time - game_time) < 2:
+    print(f"Game Length: {end_time}, Game Time: {game_time}")
+    if abs(end_time - game_time) < 1:
         print(f"Game Length: {end_time}, Game Time: {game_time}")
         return True
     return False
