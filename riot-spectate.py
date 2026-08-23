@@ -1,5 +1,5 @@
 import pyautogui
-import argparse
+import ast
 import json
 import os
 import re
@@ -13,85 +13,9 @@ from pynput.keyboard import Key, Controller
 import requests
 
 
-DEFAULT_RIOT_ID = "Zven#S16XD"
-DEFAULT_PLATFORM = "na1"
-DEFAULT_CLUSTER = "americas"
-DEFAULT_CAMERA_HEIGHT = 1500.0
-
-MAX_LEAGUE_CLIENT_STARTUP_ATTEMPTS = 5
-
-
-# GNAR ONE TRICK summoner = 유키라#키뭉이
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Look up Riot match data and, if the player is live, print a spectate command."
-    )
-    parser.add_argument(
-        "riot_id",
-        nargs="?",
-        default=DEFAULT_RIOT_ID,
-        help="Riot ID in the form GameName#TAG (example: Zven#S16XD)",
-    )
-    parser.add_argument(
-        "--game-name",
-        help="Game name part of the Riot ID. Overrides the positional riot_id if set.",
-    )
-    parser.add_argument(
-        "--tag-line",
-        help="Tag line part of the Riot ID. Overrides the positional riot_id if set.",
-    )
-    parser.add_argument(
-        "--platform",
-        default=DEFAULT_PLATFORM,
-        help="LoL platform routing value, e.g. na1, euw1, kr",
-    )
-    parser.add_argument(
-        "--cluster",
-        default=DEFAULT_CLUSTER,
-        help="Regional routing value for account lookup, e.g. americas, europe, asia",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.getenv("RIOT_API_KEY", "").strip(),
-        help="Riot API key. Prefer setting RIOT_API_KEY in your shell.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print the spectate command but do not launch League.",
-    )
-    parser.add_argument(
-        "--record",
-        action="store_true",
-        help="Start replay recording after spectate attaches and wait for the file to finish writing.",
-    )
-    parser.add_argument(
-        "--wait",
-        action="store_true",
-        help="Wait for a game to start from this summoner to record.",
-
-    )
-    parser.add_argument(
-        "--output",
-        help="Output path for --record. Defaults to ./recordings/<riot-id>-<game-id>.webm",
-    )
-    parser.add_argument(
-        "--camera-height",
-        type=float,
-        default=DEFAULT_CAMERA_HEIGHT,
-        help="Vertical offset for the follow camera when recording. Higher values look more top-down.",
-    )
-    parser.add_argument(
-        "--summoner-id",
-        help="Override the live-game lookup with a known encrypted summoner id.",
-    )
-    return parser
-
-
-def riot_get(session: requests.Session, url: str) -> requests.Response:
+def riot_get(session: requests.Session, url: str, timeout_seconds: int | float) -> requests.Response:
     try:
-        response = session.get(url, timeout=15)
+        response = session.get(url, timeout=timeout_seconds)
     except requests.exceptions.ConnectionError as e:
         print(f"Connection failed permanently: {e}")
         return None
@@ -106,12 +30,12 @@ def print_json(label: str, payload: dict) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def local_api_get(session: requests.Session, path: str) -> requests.Response:
-    return session.get(f"https://127.0.0.1:2999{path}", timeout=15, verify=False)
+def local_api_get(session: requests.Session, path: str, timeout_seconds: int | float) -> requests.Response:
+    return session.get(f"https://127.0.0.1:2999{path}", timeout=timeout_seconds, verify=False)
 
 
-def local_api_post(session: requests.Session, path: str, body: dict) -> requests.Response:
-    return session.post(f"https://127.0.0.1:2999{path}", json=body, timeout=15, verify=False)
+def local_api_post(session: requests.Session, path: str, body: dict, timeout_seconds: int | float) -> requests.Response:
+    return session.post(f"https://127.0.0.1:2999{path}", json=body, timeout=timeout_seconds, verify=False)
 
 
 def resolve_league_binary() -> tuple[Path, Path]:
@@ -148,14 +72,14 @@ def launch_spectate(binary: Path, cwd: Path, game_id: int, platform_id: str, enc
     return subprocess.Popen([str(binary), *launch_args], cwd=str(cwd))
 
 
-def wait_for_local_api(timeout_seconds: int = 50) -> requests.Session:
+def wait_for_local_api(settings: dict) -> requests.Session:
     session = requests.Session()
-    deadline = time.time() + timeout_seconds
+    deadline = time.time() + settings["local_api_timeout_seconds"]
 
     while time.time() < deadline:
         try:
-            response = local_api_get(session, "/swagger/v3/openapi.json")
-            response1 = local_api_get(session, "/liveclientdata/playerlist")
+            response = local_api_get(session, "/swagger/v3/openapi.json", settings["request_timeout_seconds"])
+            response1 = local_api_get(session, "/liveclientdata/playerlist", settings["request_timeout_seconds"])
             print(response, response1)
             if response.status_code == 200 and response1.status_code == 200:
                 print(response1.json())
@@ -164,7 +88,7 @@ def wait_for_local_api(timeout_seconds: int = 50) -> requests.Session:
                     return session
         except requests.RequestException:
             pass
-        time.sleep(2)
+        time.sleep(settings["local_api_poll_seconds"])
 
     raise TimeoutError("Timed out waiting for the League replay API to become available.")
 
@@ -174,6 +98,222 @@ def find_target_participant(game_data: dict, target_puuid: str) -> dict | None:
         if participant.get("puuid") == target_puuid:
             return participant
     return None
+
+
+def normalize_champion_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def parse_config_value(value: str):
+    value = value.strip()
+    if value in {"", "null", "None"}:
+        return None
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return value.strip('"').strip("'")
+
+
+def parse_simple_config_yaml(path: Path) -> dict:
+    config = {"settings": {}, "summoners": []}
+    current_summoner = None
+    current_section = None
+    current_settings_group = None
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if indent == 0 and line.endswith(":"):
+            current_section = line[:-1]
+            current_settings_group = None
+            continue
+
+        if current_section == "settings":
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if indent == 2 and not value:
+                config["settings"][key] = {}
+                current_settings_group = key
+            elif indent >= 4 and current_settings_group:
+                config["settings"][current_settings_group][key] = parse_config_value(value)
+            else:
+                config["settings"][key] = parse_config_value(value)
+                current_settings_group = None
+        elif current_section == "summoners" and line.startswith("- name:"):
+            value = parse_config_value(line.split(":", 1)[1])
+            current_summoner = {"name": value, "champions": []}
+            config["summoners"].append(current_summoner)
+        elif current_section == "summoners" and line.startswith("champions:") and current_summoner is not None:
+            current_summoner["champions"] = parse_config_value(line.split(":", 1)[1])
+
+    return config
+
+
+def load_raw_config(path: Path) -> dict:
+    try:
+        import yaml
+    except ImportError:
+        return parse_simple_config_yaml(path)
+
+    with path.open(encoding="utf-8") as config_file:
+        data = yaml.safe_load(config_file)
+
+    return data if isinstance(data, dict) else {}
+
+
+def config_string(settings: dict, key: str, fallback: str | None = None) -> str | None:
+    value = settings.get(key, fallback)
+    if value is None:
+        return None
+    return str(value).strip()
+
+
+def config_bool(settings: dict, key: str, fallback: bool) -> bool:
+    value = settings.get(key, fallback)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_recording_settings(settings: dict) -> dict:
+    recording = settings.get("recording", {})
+    if not isinstance(recording, dict):
+        recording = {}
+    return {
+        "width": int(recording.get("width", 1920)),
+        "height": int(recording.get("height", 1080)),
+        "frames_per_second": int(recording.get("frames_per_second", 60)),
+        "lossless": config_bool(recording, "lossless", False),
+        "enforce_frame_rate": config_bool(recording, "enforce_frame_rate", True),
+        "replay_speed": float(recording.get("replay_speed", 1.0)),
+        "start_offset_seconds": float(recording.get("start_offset_seconds", 2.0)),
+        "end_time": float(recording.get("end_time", -1.0)),
+    }
+
+
+def normalize_settings(settings: dict) -> dict:
+    if not isinstance(settings, dict):
+        settings = {}
+
+    api_key = config_string(settings, "api_key")
+    api_key_env = config_string(settings, "api_key_env", "RIOT_API_KEY")
+    if not api_key and api_key_env:
+        api_key = os.getenv(api_key_env, "").strip()
+
+    return {
+        "platform": config_string(settings, "platform", "kr").lower(),
+        "cluster": config_string(settings, "cluster", "asia").lower(),
+        "api_key": api_key or "",
+        "dry_run": config_bool(settings, "dry_run", False),
+        "record": config_bool(settings, "record", True),
+        "wait_for_match": config_bool(settings, "wait_for_match", True),
+        "output": config_string(settings, "output"),
+        "league_client_startup_attempts": int(settings.get("league_client_startup_attempts", 5)),
+        "league_process_names": settings.get("league_process_names", ["LeagueofLegends", "League of Legends"]),
+        "request_timeout_seconds": float(settings.get("request_timeout_seconds", 15)),
+        "local_api_timeout_seconds": float(settings.get("local_api_timeout_seconds", 50)),
+        "local_api_poll_seconds": float(settings.get("local_api_poll_seconds", 2)),
+        "wait_poll_seconds": float(settings.get("wait_poll_seconds", 10)),
+        "spectator_error_backoff_seconds": float(settings.get("spectator_error_backoff_seconds", 30)),
+        "recording_check_interval_seconds": float(settings.get("recording_check_interval_seconds", 5)),
+        "recording_timeout_seconds": float(settings.get("recording_timeout_seconds", 7200)),
+        "playback_finish_threshold_seconds": float(settings.get("playback_finish_threshold_seconds", 1)),
+        "window_focus_delay_seconds": float(settings.get("window_focus_delay_seconds", 1.0)),
+        "rune_tab_key": config_string(settings, "rune_tab_key", "c"),
+        "rune_tab_key_hold_seconds": float(settings.get("rune_tab_key_hold_seconds", 0.1)),
+        "fog_hotkey_hold_seconds": float(settings.get("fog_hotkey_hold_seconds", 0.10)),
+        "camera_hotkey_hold_seconds": float(settings.get("camera_hotkey_hold_seconds", 0.08)),
+        "camera_hotkey_between_presses_seconds": float(
+            settings.get("camera_hotkey_between_presses_seconds", 0.12)
+        ),
+        "recording": normalize_recording_settings(settings),
+    }
+
+
+def normalize_targets(summoners: list) -> list[dict]:
+    targets = []
+    for entry in summoners:
+        if not isinstance(entry, dict):
+            continue
+        riot_id = str(entry.get("name", "")).strip()
+        if "#" not in riot_id:
+            print(f"Skipping config entry without Name#Tag: {riot_id}")
+            continue
+        champions = entry.get("champions", [])
+        if isinstance(champions, str):
+            champions = [champions]
+        champions = [str(champion).strip() for champion in champions if str(champion).strip()]
+        if not champions:
+            print(f"Skipping {riot_id}: no champions configured.")
+            continue
+        game_name, tag_line = riot_id.split("#", 1)
+        targets.append(
+            {
+                "game_name": game_name.strip(),
+                "tag_line": tag_line.strip(),
+                "champions": champions,
+                "champion_names": {normalize_champion_name(champion) for champion in champions},
+                "champion_ids": {int(champion) for champion in champions if str(champion).isdigit()},
+            }
+        )
+
+    return targets
+
+
+def load_config(path: Path) -> dict:
+    data = load_raw_config(path)
+    summoners = data.get("summoners", []) if isinstance(data, dict) else []
+    return {
+        "settings": normalize_settings(data.get("settings", {})),
+        "targets": normalize_targets(summoners),
+    }
+
+
+def fetch_champion_id_map(session: requests.Session, settings: dict) -> dict[str, int]:
+    versions_res = session.get(
+        "https://ddragon.leagueoflegends.com/api/versions.json",
+        timeout=settings["request_timeout_seconds"],
+    )
+    versions_res.raise_for_status()
+    latest_version = versions_res.json()[0]
+    champions_res = session.get(
+        f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/en_US/champion.json",
+        timeout=settings["request_timeout_seconds"],
+    )
+    champions_res.raise_for_status()
+    champion_data = champions_res.json()["data"]
+
+    champion_ids = {}
+    for champion in champion_data.values():
+        champion_id = int(champion["key"])
+        champion_ids[normalize_champion_name(champion["id"])] = champion_id
+        champion_ids[normalize_champion_name(champion["name"])] = champion_id
+    return champion_ids
+
+
+def champion_allowed(participant: dict, target: dict, champion_id_map: dict[str, int]) -> bool:
+    champion_id = participant.get("championId")
+    if champion_id in target["champion_ids"]:
+        return True
+
+    allowed_ids = {
+        champion_id_map[name]
+        for name in target["champion_names"]
+        if name in champion_id_map
+    }
+    if allowed_ids:
+        return champion_id in allowed_ids
+
+    champion_name = participant.get("championName") or participant.get("champion")
+    return champion_name and normalize_champion_name(champion_name) in target["champion_names"]
 
 
 def sanitize_filename(value: str) -> str:
@@ -202,7 +342,7 @@ def selection_name_for_participant(participant: dict) -> str:
 
     return riot_id
 
-def get_player_hotkey(session: requests.Session, target_selection_name: str) -> str | None:
+def get_player_hotkey(session: requests.Session, target_selection_name: str, settings: dict) -> str | None:
     """
     Queries the local Live Client Data API.
     Sorts players strictly by position to guarantee exact hotkey assignment.
@@ -211,7 +351,7 @@ def get_player_hotkey(session: requests.Session, target_selection_name: str) -> 
     """
     try:
         # Request the live dataset directly from the running game engine
-        response = local_api_get(session, "/liveclientdata/playerlist")
+        response = local_api_get(session, "/liveclientdata/playerlist", settings["request_timeout_seconds"])
         if response.status_code != 200:
             print("Warning: Live Client Data API returned non-200 code.")
             return None
@@ -275,31 +415,47 @@ def get_player_hotkey(session: requests.Session, target_selection_name: str) -> 
         
     return None, None
 
-def apply_runes_tab() -> None:
-    keyboard = Controller()
 
-    # AppleScript to target the correct process
-    applescript = """
-    osascript -e '
+def applescript_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def applescript_list(values: list[str]) -> str:
+    return "{" + ", ".join(applescript_string(value) for value in values) + "}"
+
+
+def focus_league_window(settings: dict) -> None:
+    process_names = settings["league_process_names"]
+    if isinstance(process_names, str):
+        process_names = [process_names]
+
+    script = f"""
     tell application "System Events"
         set procList to name of every process
-        if procList contains "LeagueofLegends" then
-            set frontmost of process "LeagueofLegends" to true
-        else if procList contains "League of Legends" then
-            set frontmost of process "League of Legends" to true
-        end if
-    end tell'
+        repeat with procName in {applescript_list(process_names)}
+            if procList contains (procName as text) then
+                set frontmost of process (procName as text) to true
+                exit repeat
+            end if
+        end repeat
+    end tell
     """
-    os.system(applescript)
-    time.sleep(1.0) # Let the window focus fully
+    subprocess.run(["osascript", "-e", script], check=False)
+    time.sleep(settings["window_focus_delay_seconds"]) # Let the window focus fully
+
+
+def apply_runes_tab(settings: dict) -> None:
+    keyboard = Controller()
+
+    focus_league_window(settings)
     
     # Inside your function where you want to press 'q':
-    keyboard.press("c")
-    time.sleep(0.1)
-    keyboard.release("c")
+    keyboard.press(settings["rune_tab_key"])
+    time.sleep(settings["rune_tab_key_hold_seconds"])
+    keyboard.release(settings["rune_tab_key"])
 
 
-def apply_scoreboard(session: requests.Session) -> None:
+def apply_scoreboard(session: requests.Session, settings: dict) -> None:
     """
     Adds the scoreboard to the UI.
     """
@@ -307,12 +463,12 @@ def apply_scoreboard(session: requests.Session) -> None:
         "interfaceScoreboard": True
     }
     try:
-        local_api_post(session, "/replay/render", render_body)
+        local_api_post(session, "/replay/render", render_body, settings["request_timeout_seconds"])
     except Exception as e:
         print(f"Warning: Render endpoint update failed: {e}")
 
 
-def apply_fog_of_war_perspective(perspective: str, use_hotkey: bool = True) -> None:
+def apply_fog_of_war_perspective(perspective: str, settings: dict, use_hotkey: bool = True) -> None:
     """
     Changes Fog of War perspective.
     Allowed perspectives: "Blue" (F1 hotkey) or "Red" (F2 hotkey).
@@ -327,38 +483,25 @@ def apply_fog_of_war_perspective(perspective: str, use_hotkey: bool = True) -> N
         hotkey = "f1" if perspective == "blue" else "f2"
         print(f"Targeting active League window and pressing hotkey '{hotkey}' for {perspective} team POV...")
         
-        # AppleScript to target the correct macOS process
-        applescript = """
-        osascript -e '
-        tell application "System Events"
-            set procList to name of every process
-            if procList contains "LeagueofLegends" then
-                set frontmost of process "LeagueofLegends" to true
-            else if procList contains "League of Legends" then
-                set frontmost of process "League of Legends" to true
-            end if
-        end tell'
-        """
-        os.system(applescript)
-        time.sleep(1.0) # Let the window focus fully
+        focus_league_window(settings)
         
         # Execute a clean, single tap for the function key
         pyautogui.keyDown(hotkey)
-        time.sleep(0.10)
+        time.sleep(settings["fog_hotkey_hold_seconds"])
         pyautogui.keyUp(hotkey)
         
         print(f"Fog of War successfully switched to {perspective} team perspective via {hotkey}.")
     else:
         print("Hotkey simulation bypassed. Keeping default API Fog setting.")
 
-def apply_camera_lock(session: requests.Session, selection_name: str, camera_height: float, hotkey: str | None) -> None:
+def apply_camera_lock(session: requests.Session, selection_name: str, settings: dict, hotkey: str | None) -> None:
     # 1. Force the API engine into top isometric mode so fluid physics work
     render_body = {
         "cameraMode": "top",
         "selectionName": selection_name
     }
     try:
-        local_api_post(session, "/replay/render", render_body)
+        local_api_post(session, "/replay/render", render_body, settings["request_timeout_seconds"])
     except Exception as e:
         print(f"Warning: Render endpoint update failed: {e}")
 
@@ -366,96 +509,67 @@ def apply_camera_lock(session: requests.Session, selection_name: str, camera_hei
     if hotkey:
         print(f"Targeting active League window and double-pressing hotkey '{hotkey}'...")
         
-        # AppleScript to target the correct process
-        applescript = """
-        osascript -e '
-        tell application "System Events"
-            set procList to name of every process
-            if procList contains "LeagueofLegends" then
-                set frontmost of process "LeagueofLegends" to true
-            else if procList contains "League of Legends" then
-                set frontmost of process "League of Legends" to true
-            end if
-        end tell'
-        """
-        os.system(applescript)
-        time.sleep(1.0) # Let the window focus fully
+        focus_league_window(settings)
         
         # Execute the double-tap sequence that worked in testing
         pyautogui.keyDown(hotkey)
-        time.sleep(0.08)
+        time.sleep(settings["camera_hotkey_hold_seconds"])
         pyautogui.keyUp(hotkey)
         
-        time.sleep(0.12)
+        time.sleep(settings["camera_hotkey_between_presses_seconds"])
         
         pyautogui.keyDown(hotkey)
-        time.sleep(0.08)
+        time.sleep(settings["camera_hotkey_hold_seconds"])
         pyautogui.keyUp(hotkey)
         print(f"Camera fluidly locked to: {selection_name} via hotkey shortcut.")
     else:
-        # Fallback to the sequence method if hotkey parsing fails
-        playback_state = local_api_get(session, "/replay/playback").json()
-        current_time = float(playback_state.get("time", 0.0))
-        sequence_state = {
-            "selectionName": [
-                {
-                    "time": current_time,
-                    "value": selection_name,
-                    "blend": "snap",
-                }
-            ],
-            "selectionOffset": [
-                {
-                    "time": current_time,
-                    "value": {"x": 0.0, "y": camera_height, "z": 0.0},
-                    "blend": "snap",
-                }
-            ],
-        }
-        local_api_post(session, "/replay/sequence", sequence_state)
-        print(f"Camera hard-locked to: {selection_name} via Sequence API (Fallback).")
+        print(f"Could not camera-lock to {selection_name}: no hotkey available.")
 
 
-def start_recording(session: requests.Session, output_path: Path) -> None:
-    recording_state = local_api_get(session, "/replay/recording").json()
+def start_recording(session: requests.Session, output_path: Path, settings: dict) -> None:
+    recording_state = local_api_get(session, "/replay/recording", settings["request_timeout_seconds"]).json()
+    recording_settings = settings["recording"]
     body = {
         "codec": recording_state.get("codec", "webm"),
         "path": str(output_path),
-        "width": recording_state.get("width", 1920),
-        "height": recording_state.get("height", 1080),
-        "framesPerSecond": 60, # recording_state.get("framesPerSecond", 60),
-        "lossless": False, # recording_state.get("lossless", False),
-        "enforceFrameRate": True,
-        "replaySpeed": 1.0, # recording_state.get("replaySpeed", 1.0),
-        "startTime": max(0.0, recording_state.get("currentTime", 0.0) - 2.0), # recording_state.get("currentTime", 0.0),
-        "endTime": -1.0,
+        "width": recording_settings["width"],
+        "height": recording_settings["height"],
+        "framesPerSecond": recording_settings["frames_per_second"],
+        "lossless": recording_settings["lossless"],
+        "enforceFrameRate": recording_settings["enforce_frame_rate"],
+        "replaySpeed": recording_settings["replay_speed"],
+        "startTime": max(
+            0.0,
+            recording_state.get("currentTime", 0.0) - recording_settings["start_offset_seconds"],
+        ),
+        "endTime": recording_settings["end_time"],
     }
-    response = local_api_post(session, "/replay/recording", body)
+    response = local_api_post(session, "/replay/recording", body, settings["request_timeout_seconds"])
     response.raise_for_status()
     print(f"Recording started: {output_path}")
 
-def is_playback_finished(session: requests.Session) -> bool:
-    response_json = local_api_get(session, "/replay/playback").json()
+def is_playback_finished(session: requests.Session, settings: dict) -> bool:
+    response_json = local_api_get(session, "/replay/playback", settings["request_timeout_seconds"]).json()
     # if match time is near total playback length
     end_time = response_json["length"]
     game_time = response_json["time"]
     print(f"Game Length: {end_time}, Game Time: {game_time}")
-    if abs(end_time - game_time) < 1:
+    if abs(end_time - game_time) < settings["playback_finish_threshold_seconds"]:
         print(f"Game Length: {end_time}, Game Time: {game_time}")
         return True
     return False
 
-def wait_for_recording_to_finish(session: requests.Session, output_path: Path, timeout_seconds: int = 7200) -> None:
-    deadline = time.time() + timeout_seconds
+def wait_for_recording_to_finish(session: requests.Session, output_path: Path, settings: dict) -> None:
+    deadline = time.time() + settings["recording_timeout_seconds"]
     last_state = None
     while time.time() < deadline:
         print("Waiting for playback to complete.")
-        state = local_api_get(session, "/replay/recording").json()
+        state = local_api_get(session, "/replay/recording", settings["request_timeout_seconds"]).json()
         last_state = state
         if state.get("recording") is False and state.get("path"):
             print(f"Recording finished: {state['path']}")
             return
-        if is_playback_finished(session):
+        if is_playback_finished(session, settings):
             print("Playback API determined game is over.")
             return
         print(
@@ -464,30 +578,30 @@ def wait_for_recording_to_finish(session: requests.Session, output_path: Path, t
             f"currentTime={state.get('currentTime')} "
             f"path={state.get('path', '')}"
         )
-        time.sleep(5)
+        time.sleep(settings["recording_check_interval_seconds"])
 
     raise TimeoutError(f"Timed out waiting for recording to finish. Last state: {last_state}")
 
-def wait_for_match_to_begin(session: requests.Session, headers: dict, spectator_url: str, wait_for_match: str):
+def wait_for_match_to_begin(session: requests.Session, headers: dict, spectator_url: str, settings: dict):
     # wait for a match if 
     while True:
-        spec_res = riot_get(session, spectator_url)
+        spec_res = riot_get(session, spectator_url, settings["request_timeout_seconds"])
         if spec_res is None:
             session = requests.Session()
             session.headers.update(headers)
         elif spec_res.status_code == 404:
             print("Player is not in a live game.")
             # Dont wait if not explicitly set
-            if not wait_for_match:
+            if not settings["wait_for_match"]:
                 break
             print("Waiting...")
-            time.sleep(10)
+            time.sleep(settings["wait_poll_seconds"])
         elif spec_res.status_code != 200:
             print(
                 f"Spectator lookup failed: {spec_res.status_code}\n"
                 f"{spec_res.text.strip()}"
             )
-            time.sleep(30)
+            time.sleep(settings["spectator_error_backoff_seconds"])
         elif spec_res.status_code == 200:
             print("Found a match.")
             break
@@ -495,38 +609,24 @@ def wait_for_match_to_begin(session: requests.Session, headers: dict, spectator_
     return spec_res
 
 
-def get_match_data(
+def lookup_target(
+    session: requests.Session,
+    settings: dict,
+    cluster: str,
+    platform: str,
     game_name: str,
     tag_line: str,
-    platform: str,
-    cluster: str,
-    api_key: str,
-    dry_run: bool,
-    record: bool,
-    output_override: str | None,
-    summoner_id_override: str | None,
-    camera_height: float,
-    wait_for_match: bool,
-) -> None:
-    if not api_key:
-        print("Missing Riot API key. Set RIOT_API_KEY or pass --api-key.")
-        sys.exit(1)
-
-    headers = {"X-Riot-Token": api_key}
-    session = requests.Session()
-    session.headers.update(headers)
-
+) -> dict | None:
     account_url = (
         f"https://{cluster}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/"
         f"{quote(game_name)}/{quote(tag_line)}"
     )
-    account_res = riot_get(session, account_url)
-    if account_res.status_code != 200:
-        print(
-            f"Account lookup failed: {account_res.status_code}\n"
-            f"{account_res.text.strip()}"
-        )
-        sys.exit(1)
+    account_res = riot_get(session, account_url, settings["request_timeout_seconds"])
+    if account_res is None or account_res.status_code != 200:
+        status = getattr(account_res, "status_code", "no response")
+        body = account_res.text.strip() if account_res is not None else ""
+        print(f"Account lookup failed for {game_name}#{tag_line}: {status}\n{body}")
+        return None
 
     account_data = account_res.json()
     puuid = account_data["puuid"]
@@ -534,18 +634,15 @@ def get_match_data(
     print(f"PUUID: {puuid}")
 
     summoner_url = f"https://{platform}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{quote(puuid)}"
-    summoner_res = riot_get(session, summoner_url)
-    if summoner_res.status_code != 200:
-        print(
-            f"Summoner lookup failed: {summoner_res.status_code}\n"
-            f"{summoner_res.text.strip()}"
-        )
-        sys.exit(1)
+    summoner_res = riot_get(session, summoner_url, settings["request_timeout_seconds"])
+    if summoner_res is None or summoner_res.status_code != 200:
+        status = getattr(summoner_res, "status_code", "no response")
+        body = summoner_res.text.strip() if summoner_res is not None else ""
+        print(f"Summoner lookup failed for {game_name}#{tag_line}: {status}\n{body}")
+        return None
 
     summoner_data = summoner_res.json()
     summoner_id = summoner_data.get("id") or summoner_data.get("summonerId")
-    if summoner_id_override:
-        summoner_id = summoner_id_override
 
     if not summoner_id:
         print("Summoner lookup did not return an id or summonerId.")
@@ -556,12 +653,84 @@ def get_match_data(
         print_json("Summoner payload:", summoner_data)
     print(f"Summoner ID: {summoner_id}")
 
-    spectator_url = f"https://{platform}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/{quote(summoner_id)}"
-    spec_res = wait_for_match_to_begin(session, headers, spectator_url, wait_for_match)
-    if not hasattr(spec_res, "status_code") or spec_res.status_code != 200:
-        print("Didn't find a match, exit.")
-        return
-    game_data = spec_res.json()
+    return {
+        "game_name": game_name,
+        "tag_line": tag_line,
+        "puuid": puuid,
+        "summoner_id": summoner_id,
+    }
+
+
+def wait_for_configured_match(
+    session: requests.Session,
+    headers: dict,
+    targets: list[dict],
+    settings: dict,
+) -> tuple[dict, dict, dict] | None:
+    champion_id_map = fetch_champion_id_map(session, settings)
+
+    unresolved = sorted(
+        {
+            champion
+            for target in targets
+            for champion in target["champion_names"]
+            if champion not in champion_id_map and not champion.isdigit()
+        }
+    )
+    if unresolved:
+        print(f"Warning: could not resolve champion names: {', '.join(unresolved)}")
+
+    while True:
+        for target in targets:
+            spectator_url = (
+                f"https://{settings['platform']}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/"
+                f"{quote(target['summoner_id'])}"
+            )
+            spec_res = riot_get(session, spectator_url, settings["request_timeout_seconds"])
+            if spec_res is None:
+                session = requests.Session()
+                session.headers.update(headers)
+                continue
+            if spec_res.status_code == 404:
+                print(f"{target['game_name']}#{target['tag_line']} is not in a live game.")
+                continue
+            if spec_res.status_code != 200:
+                print(
+                    f"Spectator lookup failed for {target['game_name']}#{target['tag_line']}: "
+                    f"{spec_res.status_code}\n{spec_res.text.strip()}"
+                )
+                continue
+
+            game_data = spec_res.json()
+            target_participant = find_target_participant(game_data, target["puuid"])
+            if not target_participant:
+                print(f"Found a match for {target['game_name']}#{target['tag_line']}, but not their participant data.")
+                continue
+            if not champion_allowed(target_participant, target, champion_id_map):
+                print(
+                    f"Found {target['game_name']}#{target['tag_line']} in a live game, "
+                    f"but championId {target_participant.get('championId')} is not in their configured champions."
+                )
+                continue
+
+            print(f"Found a matching live game for {target['game_name']}#{target['tag_line']}.")
+            return game_data, target, target_participant
+
+        if not settings["wait_for_match"]:
+            return None
+
+        print("No configured player is in a matching live game. Waiting...")
+        time.sleep(settings["wait_poll_seconds"])
+
+
+def spectate_match(
+    game_data: dict,
+    game_name: str,
+    tag_line: str,
+    puuid: str,
+    settings: dict,
+    target_participant: dict | None = None,
+) -> None:
     print_json("Live game payload:", game_data)
 
     game_id = game_data["gameId"]
@@ -579,11 +748,11 @@ def get_match_data(
     print("Spectate command:")
     print(launch_command)
 
-    if dry_run:
+    if settings["dry_run"]:
         return
 
     attempt = 0
-    while attempt < MAX_LEAGUE_CLIENT_STARTUP_ATTEMPTS:
+    while attempt < settings["league_client_startup_attempts"]:
         process = launch_spectate(
             binary=binary,
             cwd=cwd,
@@ -593,7 +762,7 @@ def get_match_data(
         )
 
         try:
-            local_session = wait_for_local_api()
+            local_session = wait_for_local_api(settings)
         except TimeoutError as exc:
             print(exc)
             process.terminate()
@@ -605,67 +774,107 @@ def get_match_data(
         print("Unable to successfully start spectate. Quitting.")
         return
 
-    target_participant = find_target_participant(game_data, puuid)
-    target_selection_name = selection_name_for_participant(target_participant)
-    player_hotkey, team = get_player_hotkey(local_session, target_selection_name)
-    apply_fog_of_war_perspective(team)
-    apply_scoreboard(local_session)
-    if target_participant and target_participant.get("riotId"):
+    if target_participant is None:
+        target_participant = find_target_participant(game_data, puuid)
+
+    target_selection_name = None
+    player_hotkey = None
+    team = None
+    if target_participant:
+        target_selection_name = selection_name_for_participant(target_participant)
+        player_hotkey, team = get_player_hotkey(local_session, target_selection_name, settings)
+    if team:
+        apply_fog_of_war_perspective(team, settings)
+    else:
+        print("Could not determine team perspective for the target player.")
+    apply_scoreboard(local_session, settings)
+    if target_participant and target_participant.get("riotId") and target_selection_name:
         apply_camera_lock(
             local_session,
             target_selection_name,
-            camera_height,
+            settings,
             player_hotkey,
         )
     else:
         print("Could not find a matching participant to lock the camera to.")
-    apply_runes_tab()
+    apply_runes_tab(settings)
 
-    if not record:
+    if not settings["record"]:
         return
 
-    output_path = build_recording_output_path(game_name, tag_line, game_id, output_override)
-    start_recording(local_session, output_path)
-    if target_participant and target_participant.get("riotId"):
+    output_path = build_recording_output_path(game_name, tag_line, game_id, settings["output"])
+    start_recording(local_session, output_path, settings)
+    if target_participant and target_participant.get("riotId") and target_selection_name:
         apply_camera_lock(
             local_session,
             target_selection_name,
-            camera_height,  
+            settings,
             player_hotkey,
         )
     else:
         print("Could not find a matching participant to lock the camera to.")
-    wait_for_recording_to_finish(local_session, output_path)
+    wait_for_recording_to_finish(local_session, output_path, settings)
     process.terminate()
 
-if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
 
-    if args.game_name or args.tag_line:
-        if not (args.game_name and args.tag_line):
-            print("Both --game-name and --tag-line are required when using the explicit Riot ID flags.")
-            sys.exit(1)
-        game_name = args.game_name.strip()
-        tag_line = args.tag_line.strip()
-    else:
-        if "#" not in args.riot_id:
-            print("Riot ID must be in the form GameName#TAG.")
-            sys.exit(1)
-        game_name, tag_line = args.riot_id.split("#", 1)
-        game_name = game_name.strip()
-        tag_line = tag_line.strip()
+def run_from_config(config_path: Path) -> None:
+    if not config_path.exists():
+        print(f"Config file not found: {config_path}")
+        sys.exit(1)
 
-    get_match_data(
-        game_name=game_name,
-        tag_line=tag_line,
-        platform=args.platform.strip().lower(),
-        cluster=args.cluster.strip().lower(),
-        api_key=args.api_key,
-        dry_run=args.dry_run,
-        record=args.record,
-        output_override=args.output,
-        summoner_id_override=args.summoner_id.strip() if args.summoner_id else None,
-        camera_height=args.camera_height,
-        wait_for_match=args.wait,
+    config = load_config(config_path)
+    settings = config["settings"]
+    config_targets = config["targets"]
+    if not config_targets:
+        print(f"No valid summoners found in config: {config_path}")
+        sys.exit(1)
+
+    if not settings["api_key"]:
+        print("Missing Riot API key. Set the configured api_key_env or api_key in config.yaml.")
+        sys.exit(1)
+
+    headers = {"X-Riot-Token": settings["api_key"]}
+    session = requests.Session()
+    session.headers.update(headers)
+
+    targets = []
+    for config_target in config_targets:
+        target = lookup_target(
+            session=session,
+            settings=settings,
+            cluster=settings["cluster"],
+            platform=settings["platform"],
+            game_name=config_target["game_name"],
+            tag_line=config_target["tag_line"],
+        )
+        if not target:
+            continue
+        target.update(config_target)
+        targets.append(target)
+
+    if not targets:
+        print("Could not resolve any configured summoners.")
+        sys.exit(1)
+
+    match = wait_for_configured_match(
+        session=session,
+        headers=headers,
+        targets=targets,
+        settings=settings,
     )
+    if not match:
+        print("Didn't find a matching configured live game, exit.")
+        return
+
+    game_data, target, target_participant = match
+    spectate_match(
+        game_data=game_data,
+        game_name=target["game_name"],
+        tag_line=target["tag_line"],
+        puuid=target["puuid"],
+        settings=settings,
+        target_participant=target_participant,
+    )
+
+if __name__ == "__main__":
+    run_from_config(Path("config.yaml"))
