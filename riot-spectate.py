@@ -215,6 +215,7 @@ def normalize_settings(settings: dict) -> dict:
         "dry_run": config_bool(settings, "dry_run", False),
         "record": config_bool(settings, "record", True),
         "wait_for_match": config_bool(settings, "wait_for_match", True),
+        "num_games": int(settings.get("num_games", 1)),
         "output": config_string(settings, "output"),
         "league_client_startup_attempts": int(settings.get("league_client_startup_attempts", 5)),
         "league_process_names": settings.get("league_process_names", ["LeagueofLegends", "League of Legends"]),
@@ -666,7 +667,9 @@ def wait_for_configured_match(
     headers: dict,
     targets: list[dict],
     settings: dict,
+    ignored_game_ids: set[int] | None = None,
 ) -> tuple[dict, dict, dict] | None:
+    ignored_game_ids = ignored_game_ids or set()
     champion_id_map = fetch_champion_id_map(session, settings)
 
     unresolved = sorted(
@@ -702,6 +705,14 @@ def wait_for_configured_match(
                 continue
 
             game_data = spec_res.json()
+            game_id = game_data.get("gameId")
+            if game_id in ignored_game_ids:
+                print(
+                    f"Skipping already watched game {game_id} for "
+                    f"{target['game_name']}#{target['tag_line']}."
+                )
+                continue
+
             target_participant = find_target_participant(game_data, target["puuid"])
             if not target_participant:
                 print(f"Found a match for {target['game_name']}#{target['tag_line']}, but not their participant data.")
@@ -824,6 +835,11 @@ def run_from_config(config_path: Path) -> None:
 
     config = load_config(config_path)
     settings = config["settings"]
+    num_games = settings["num_games"]
+    if num_games < 1:
+        print("settings.num_games must be at least 1.")
+        sys.exit(1)
+
     config_targets = config["targets"]
     if not config_targets:
         print(f"No valid summoners found in config: {config_path}")
@@ -856,25 +872,29 @@ def run_from_config(config_path: Path) -> None:
         print("Could not resolve any configured summoners.")
         sys.exit(1)
 
-    match = wait_for_configured_match(
-        session=session,
-        headers=headers,
-        targets=targets,
-        settings=settings,
-    )
-    if not match:
-        print("Didn't find a matching configured live game, exit.")
-        return
+    watched_game_ids = set()
+    for game_number in range(1, num_games + 1):
+        print(f"Waiting for matching game {game_number} of {num_games}.")
+        match = wait_for_configured_match(
+            session=session,
+            headers=headers,
+            targets=targets,
+            settings=settings,
+            ignored_game_ids=watched_game_ids,
+        )
+        if not match:
+            print("Didn't find a matching configured live game, exit.")
+            return
 
-    game_data, target, target_participant = match
-    spectate_match(
-        game_data=game_data,
-        game_name=target["game_name"],
-        tag_line=target["tag_line"],
-        puuid=target["puuid"],
-        settings=settings,
-        target_participant=target_participant,
-    )
-
+        game_data, target, target_participant = match
+        watched_game_ids.add(game_data["gameId"])
+        spectate_match(
+            game_data=game_data,
+            game_name=target["game_name"],
+            tag_line=target["tag_line"],
+            puuid=target["puuid"],
+            settings=settings,
+            target_participant=target_participant,
+        )
 if __name__ == "__main__":
     run_from_config(Path("config.yaml"))

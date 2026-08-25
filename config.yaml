@@ -5,6 +5,7 @@ settings:
   dry_run: false
   record: true
   wait_for_match: true
+  num_games: 10
   output: null
   league_client_startup_attempts: 5
   league_process_names: ["LeagueofLegends", "League of Legends"]
@@ -51,3 +52,5 @@ summoners:
     champions: ["Gnar"]
   - name: "MIDKING#asd"
     champions: ["Zoey"]
+  - name: "Athene#lll"
+    champions: ["Gnar"]

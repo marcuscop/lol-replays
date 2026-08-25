@@ -46,6 +46,7 @@ settings:
   api_key_env: "TEST_RIOT_KEY"
   record: true
   wait_for_match: false
+  num_games: 2
   request_timeout_seconds: 7
   recording:
     width: 1280
@@ -73,6 +74,7 @@ summoners:
     assert settings["api_key"] == "from-env"
     assert settings["record"]
     assert not settings["wait_for_match"]
+    assert settings["num_games"] == 2
     assert settings["request_timeout_seconds"] == 7
     assert settings["recording"]["width"] == 1280
     assert settings["recording"]["height"] == 720
@@ -129,6 +131,74 @@ def test_applescript_list_quotes_process_names():
         riot_spectate.applescript_list(["LeagueofLegends", "League of Legends"])
         == '{"LeagueofLegends", "League of Legends"}'
     )
+
+
+def test_normalize_settings_defaults_num_games_to_one():
+    assert riot_spectate.normalize_settings({})["num_games"] == 1
+
+
+def test_run_from_config_spectates_configured_number_of_games(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("settings: {}\nsummoners: []\n", encoding="utf-8")
+    settings = riot_spectate.normalize_settings(
+        {"api_key": "key", "wait_for_match": False, "num_games": 2}
+    )
+    config_target = {
+        "game_name": "Rascal",
+        "tag_line": "1231",
+        "champions": ["Gnar"],
+        "champion_names": {"gnar"},
+        "champion_ids": set(),
+    }
+    resolved_target = {
+        "game_name": "Rascal",
+        "tag_line": "1231",
+        "summoner_id": "target-id",
+        "puuid": "target-puuid",
+    }
+    participant = {"puuid": "target-puuid", "championId": 150, "riotId": "Rascal#1231"}
+    games = [
+        {"gameId": 111, "participants": [participant]},
+        {"gameId": 222, "participants": [participant]},
+    ]
+    ignored_game_ids_seen = []
+    spectated_game_ids = []
+
+    monkeypatch.setattr(
+        riot_spectate,
+        "load_config",
+        lambda path: {"settings": settings, "targets": [config_target]},
+    )
+    monkeypatch.setattr(
+        riot_spectate,
+        "lookup_target",
+        lambda **kwargs: dict(resolved_target),
+    )
+
+    def fake_wait_for_configured_match(
+        session,
+        headers,
+        targets,
+        settings,
+        ignored_game_ids=None,
+    ):
+        ignored_game_ids_seen.append(set(ignored_game_ids or set()))
+        return games[len(ignored_game_ids_seen) - 1], targets[0], participant
+
+    def fake_spectate_match(**kwargs):
+        spectated_game_ids.append(kwargs["game_data"]["gameId"])
+
+    monkeypatch.setattr(
+        riot_spectate,
+        "wait_for_configured_match",
+        fake_wait_for_configured_match,
+    )
+    monkeypatch.setattr(riot_spectate, "spectate_match", fake_spectate_match)
+
+    riot_spectate.run_from_config(config_path)
+
+    assert ignored_game_ids_seen == [set(), {111}]
+    assert spectated_game_ids == [111, 222]
 
 
 def test_wait_for_configured_match_returns_first_live_allowed_champion(monkeypatch):
