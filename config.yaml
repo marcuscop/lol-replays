@@ -1,3 +1,5 @@
+# Remember to update league through riot client before using.
+
 settings:
   platform: "kr"
   cluster: "asia"
@@ -28,7 +30,7 @@ settings:
     height: 1080
     frames_per_second: 60
     lossless: false
-    enforce_frame_rate: true
+    enforce_frame_rate: false
     replay_speed: 1.0
     start_offset_seconds: 2.0
     end_time: -1.0

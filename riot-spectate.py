@@ -20,7 +20,7 @@ def riot_get(session: requests.Session, url: str, timeout_seconds: int | float) 
         print(f"Connection failed permanently: {e}")
         return None
     except requests.exceptions.ReadTimeout as e:
-        print(f"Read timed out.")
+        print(f"Read timed out. {e}")
         return None
     return response
 
