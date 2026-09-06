@@ -79,6 +79,11 @@ summoners:
     assert settings["recording"]["width"] == 1280
     assert settings["recording"]["height"] == 720
     assert settings["recording"]["frames_per_second"] == 30
+    assert not settings["display_mode"]["enabled"]
+    assert settings["display_mode"]["resolution"] == "1920x1200"
+    assert not settings["league_game_config"]["enabled"]
+    assert settings["league_game_config"]["width"] == 1920
+    assert settings["league_game_config"]["height"] == 1080
     assert [
         (target["game_name"], target["tag_line"], target["champions"])
         for target in targets
@@ -329,6 +334,150 @@ def test_start_recording_uses_configured_recording_settings(monkeypatch, tmp_pat
         "startTime": 6.0,
         "endTime": 123.0,
     }
+
+
+def test_run_betterdisplay_display_mode_uses_configured_resolution(monkeypatch, tmp_path):
+    betterdisplay = tmp_path / "BetterDisplay"
+    betterdisplay.write_text("", encoding="utf-8")
+    calls = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(args, check=False, capture_output=False, text=False):
+        calls.append(
+            {
+                "args": args,
+                "check": check,
+                "capture_output": capture_output,
+                "text": text,
+            }
+        )
+        return FakeResult()
+
+    monkeypatch.setattr(riot_spectate.subprocess, "run", fake_run)
+    monkeypatch.setattr(riot_spectate.time, "sleep", lambda seconds: None)
+
+    settings = riot_spectate.normalize_settings(
+        {
+            "display_mode": {
+                "enabled": True,
+                "betterdisplay_path": str(betterdisplay),
+                "selector": "-displaywithmainstatus",
+                "resolution": "1920x1200",
+                "hi_dpi": "on",
+                "settle_seconds": 0.5,
+            },
+        }
+    )
+
+    riot_spectate.run_betterdisplay_display_mode(settings["display_mode"])
+
+    assert calls == [
+        {
+            "args": [
+                str(betterdisplay),
+                "set",
+                "-displaywithmainstatus",
+                "-resolution=1920x1200",
+                "-hidpi=on",
+            ],
+            "check": False,
+            "capture_output": True,
+            "text": True,
+        }
+    ]
+
+
+def test_run_betterdisplay_display_mode_can_use_mode_number(monkeypatch, tmp_path):
+    betterdisplay = tmp_path / "BetterDisplay"
+    betterdisplay.write_text("", encoding="utf-8")
+    captured_args = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        riot_spectate.subprocess,
+        "run",
+        lambda args, **kwargs: captured_args.append(args) or FakeResult(),
+    )
+
+    settings = riot_spectate.normalize_settings(
+        {
+            "display_mode": {
+                "enabled": True,
+                "betterdisplay_path": str(betterdisplay),
+                "display_mode_number": 556,
+                "settle_seconds": 0,
+            },
+        }
+    )
+
+    riot_spectate.run_betterdisplay_display_mode(settings["display_mode"])
+
+    assert captured_args == [
+        [
+            str(betterdisplay),
+            "set",
+            "-displaywithmainstatus",
+            "-displaymodenumber=556",
+        ]
+    ]
+
+
+def test_write_league_game_config_updates_general_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(riot_spectate.time, "strftime", lambda fmt: "20260906120000")
+    game_cfg = tmp_path / "game.cfg"
+    game_cfg.write_text(
+        """[General]
+WindowMode=0
+Height=1200
+Width=1920
+Other=1
+
+[Performance]
+ShadowQuality=2
+""",
+        encoding="utf-8",
+    )
+    settings = riot_spectate.normalize_settings(
+        {
+            "league_game_config": {
+                "enabled": True,
+                "path": str(game_cfg),
+                "window_mode": 1,
+                "width": 1920,
+                "height": 1080,
+                "backup": True,
+            },
+        }
+    )
+
+    riot_spectate.write_league_game_config(settings["league_game_config"])
+
+    assert game_cfg.read_text(encoding="utf-8") == """[General]
+WindowMode=1
+Height=1080
+Width=1920
+Other=1
+
+[Performance]
+ShadowQuality=2
+"""
+    assert (tmp_path / "game.cfg.bak.20260906120000").read_text(encoding="utf-8") == """[General]
+WindowMode=0
+Height=1200
+Width=1920
+Other=1
+
+[Performance]
+ShadowQuality=2
+"""
 
 
 def test_is_playback_finished_requires_consecutive_near_end_seconds(monkeypatch):

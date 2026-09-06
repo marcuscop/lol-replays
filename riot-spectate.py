@@ -199,6 +199,44 @@ def normalize_recording_settings(settings: dict) -> dict:
     }
 
 
+def normalize_display_mode_settings(settings: dict) -> dict:
+    display_mode = settings.get("display_mode", {})
+    if not isinstance(display_mode, dict):
+        display_mode = {}
+    return {
+        "enabled": config_bool(display_mode, "enabled", False),
+        "betterdisplay_path": config_string(
+            display_mode,
+            "betterdisplay_path",
+            "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay",
+        ),
+        "selector": config_string(display_mode, "selector", "-displaywithmainstatus"),
+        "resolution": config_string(display_mode, "resolution", "1920x1200"),
+        "hi_dpi": config_string(display_mode, "hi_dpi"),
+        "refresh_rate": config_string(display_mode, "refresh_rate"),
+        "display_mode_number": config_string(display_mode, "display_mode_number"),
+        "settle_seconds": float(display_mode.get("settle_seconds", 2.0)),
+    }
+
+
+def normalize_league_game_config_settings(settings: dict) -> dict:
+    league_game_config = settings.get("league_game_config", {})
+    if not isinstance(league_game_config, dict):
+        league_game_config = {}
+    return {
+        "enabled": config_bool(league_game_config, "enabled", False),
+        "path": config_string(
+            league_game_config,
+            "path",
+            "/Applications/League of Legends.app/Contents/LoL/Config/game.cfg",
+        ),
+        "window_mode": int(league_game_config.get("window_mode", 1)),
+        "width": int(league_game_config.get("width", 1920)),
+        "height": int(league_game_config.get("height", 1080)),
+        "backup": config_bool(league_game_config, "backup", True),
+    }
+
+
 def normalize_settings(settings: dict) -> dict:
     if not isinstance(settings, dict):
         settings = {}
@@ -239,6 +277,8 @@ def normalize_settings(settings: dict) -> dict:
             settings.get("camera_hotkey_between_presses_seconds", 0.12)
         ),
         "recording": normalize_recording_settings(settings),
+        "display_mode": normalize_display_mode_settings(settings),
+        "league_game_config": normalize_league_game_config_settings(settings),
     }
 
 
@@ -279,6 +319,91 @@ def load_config(path: Path) -> dict:
         "settings": normalize_settings(data.get("settings", {})),
         "targets": normalize_targets(summoners),
     }
+
+
+def run_betterdisplay_display_mode(display_mode: dict) -> None:
+    if not display_mode["enabled"]:
+        return
+
+    betterdisplay_path = Path(display_mode["betterdisplay_path"]).expanduser()
+    if not betterdisplay_path.exists():
+        raise FileNotFoundError(f"BetterDisplay CLI not found: {betterdisplay_path}")
+
+    args = [str(betterdisplay_path), "set"]
+    selector = display_mode["selector"]
+    if selector:
+        args.append(selector)
+    if display_mode["display_mode_number"]:
+        args.append(f"-displaymodenumber={display_mode['display_mode_number']}")
+    else:
+        args.append(f"-resolution={display_mode['resolution']}")
+        if display_mode["hi_dpi"] is not None:
+            args.append(f"-hidpi={display_mode['hi_dpi']}")
+        if display_mode["refresh_rate"] is not None:
+            args.append(f"-refreshrate={display_mode['refresh_rate']}")
+
+    print("Setting display mode with BetterDisplay:")
+    print(" ".join(args))
+    result = subprocess.run(args, check=False, capture_output=True, text=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.stderr.strip():
+        print(result.stderr.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            "BetterDisplay failed to set the display mode. "
+            "Make sure Settings > Application > Integration has command line integration enabled."
+        )
+
+    settle_seconds = display_mode["settle_seconds"]
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+
+
+def replace_ini_key(section: str, key: str, value: int | str) -> str:
+    replacement = f"{key}={value}"
+    pattern = rf"(?m)^{re.escape(key)}=.*$"
+    if re.search(pattern, section):
+        return re.sub(pattern, replacement, section)
+    return section.rstrip() + f"\n{replacement}\n"
+
+
+def write_league_game_config(league_game_config: dict) -> None:
+    if not league_game_config["enabled"]:
+        return
+
+    config_path = Path(league_game_config["path"]).expanduser()
+    if not config_path.exists():
+        raise FileNotFoundError(f"League game config not found: {config_path}")
+
+    original = config_path.read_text(encoding="utf-8")
+    if league_game_config["backup"]:
+        backup_path = config_path.with_name(f"{config_path.name}.bak.{time.strftime('%Y%m%d%H%M%S')}")
+        backup_path.write_text(original, encoding="utf-8")
+        print(f"Backed up League game config: {backup_path}")
+
+    def update_general(match: re.Match) -> str:
+        section = match.group(0)
+        section = replace_ini_key(section, "WindowMode", league_game_config["window_mode"])
+        section = replace_ini_key(section, "Height", league_game_config["height"])
+        section = replace_ini_key(section, "Width", league_game_config["width"])
+        return section
+
+    updated, count = re.subn(r"\[General\].*?(?=\n\[|\Z)", update_general, original, count=1, flags=re.S)
+    if count != 1:
+        raise ValueError(f"[General] section not found in League game config: {config_path}")
+
+    config_path.write_text(updated, encoding="utf-8")
+    print(
+        "League game config set to "
+        f"WindowMode={league_game_config['window_mode']} "
+        f"Width={league_game_config['width']} Height={league_game_config['height']}"
+    )
+
+
+def prepare_capture_environment(settings: dict) -> None:
+    run_betterdisplay_display_mode(settings["display_mode"])
+    write_league_game_config(settings["league_game_config"])
 
 
 def fetch_champion_id_map(session: requests.Session, settings: dict) -> dict[str, int]:
@@ -782,6 +907,8 @@ def spectate_match(
 
     if settings["dry_run"]:
         return
+
+    prepare_capture_environment(settings)
 
     attempt = 0
     while attempt < settings["league_client_startup_attempts"]:

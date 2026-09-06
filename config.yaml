@@ -26,9 +26,25 @@ settings:
   fog_hotkey_hold_seconds: 0.10
   camera_hotkey_hold_seconds: 0.08
   camera_hotkey_between_presses_seconds: 0.12
+  display_mode:
+    enabled: true
+    betterdisplay_path: "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay"
+    selector: "-displaywithmainstatus"
+    resolution: "1920x1200"
+    hi_dpi: "on"
+    refresh_rate: null
+    display_mode_number: 72
+    settle_seconds: 2.0
+  league_game_config:
+    enabled: true
+    path: "/Applications/League of Legends.app/Contents/LoL/Config/game.cfg"
+    window_mode: 1
+    width: 1920
+    height: 1080
+    backup: true
   recording:
     width: 1920
-    height: 1200
+    height: 1080
     frames_per_second: 60
     lossless: false
     enforce_frame_rate: false
