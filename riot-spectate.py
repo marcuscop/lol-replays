@@ -227,6 +227,9 @@ def normalize_settings(settings: dict) -> dict:
         "recording_check_interval_seconds": float(settings.get("recording_check_interval_seconds", 5)),
         "recording_timeout_seconds": float(settings.get("recording_timeout_seconds", 7200)),
         "playback_finish_threshold_seconds": float(settings.get("playback_finish_threshold_seconds", 1)),
+        "playback_finish_confirmation_seconds": float(
+            settings.get("playback_finish_confirmation_seconds", 5)
+        ),
         "window_focus_delay_seconds": float(settings.get("window_focus_delay_seconds", 1.0)),
         "rune_tab_key": config_string(settings, "rune_tab_key", "c"),
         "rune_tab_key_hold_seconds": float(settings.get("rune_tab_key_hold_seconds", 0.1)),
@@ -549,20 +552,38 @@ def start_recording(session: requests.Session, output_path: Path, settings: dict
     response.raise_for_status()
     print(f"Recording started: {output_path}")
 
-def is_playback_finished(session: requests.Session, settings: dict) -> bool:
+def is_playback_finished(session: requests.Session, settings: dict, finish_state: dict | None = None) -> bool:
     response_json = local_api_get(session, "/replay/playback", settings["request_timeout_seconds"]).json()
-    # if match time is near total playback length
     end_time = response_json["length"]
     game_time = response_json["time"]
-    print(f"Game Length: {end_time}, Game Time: {game_time}")
-    if abs(end_time - game_time) < settings["playback_finish_threshold_seconds"]:
+
+    is_near_end = abs(end_time - game_time) < settings["playback_finish_threshold_seconds"]
+    if not is_near_end:
+        if finish_state is not None:
+            finish_state.pop("near_end_started_at", None)
         print(f"Game Length: {end_time}, Game Time: {game_time}")
+        return False
+
+    now = time.monotonic()
+    confirmation_seconds = settings["playback_finish_confirmation_seconds"]
+    if finish_state is None:
+        near_end_seconds = confirmation_seconds
+    else:
+        near_end_started_at = finish_state.setdefault("near_end_started_at", now)
+        near_end_seconds = now - near_end_started_at
+
+    print(
+        f"Game Length: {end_time}, Game Time: {game_time}, "
+        f"Near End Seconds: {near_end_seconds:.1f}"
+    )
+    if near_end_seconds >= confirmation_seconds:
         return True
     return False
 
 def wait_for_recording_to_finish(session: requests.Session, output_path: Path, settings: dict) -> None:
     deadline = time.time() + settings["recording_timeout_seconds"]
     last_state = None
+    playback_finish_state = {}
     while time.time() < deadline:
         print("Waiting for playback to complete.")
         state = local_api_get(session, "/replay/recording", settings["request_timeout_seconds"]).json()
@@ -570,7 +591,7 @@ def wait_for_recording_to_finish(session: requests.Session, output_path: Path, s
         if state.get("recording") is False and state.get("path"):
             print(f"Recording finished: {state['path']}")
             return
-        if is_playback_finished(session, settings):
+        if is_playback_finished(session, settings, playback_finish_state):
             print("Playback API determined game is over.")
             return
         print(

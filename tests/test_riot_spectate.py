@@ -329,3 +329,65 @@ def test_start_recording_uses_configured_recording_settings(monkeypatch, tmp_pat
         "startTime": 6.0,
         "endTime": 123.0,
     }
+
+
+def test_is_playback_finished_requires_consecutive_near_end_seconds(monkeypatch):
+    settings = riot_spectate.normalize_settings(
+        {
+            "request_timeout_seconds": 9,
+            "playback_finish_threshold_seconds": 1,
+            "playback_finish_confirmation_seconds": 5,
+        }
+    )
+    playback_responses = [
+        {"length": 100.0, "time": 99.5},
+        {"length": 100.0, "time": 99.6},
+        {"length": 100.0, "time": 99.7},
+    ]
+    monotonic_times = iter([10.0, 14.0, 15.1])
+
+    def fake_local_api_get(session, path, timeout_seconds):
+        assert path == "/replay/playback"
+        assert timeout_seconds == 9
+        return FakeResponse(200, playback_responses.pop(0))
+
+    monkeypatch.setattr(riot_spectate, "local_api_get", fake_local_api_get)
+    monkeypatch.setattr(riot_spectate.time, "monotonic", lambda: next(monotonic_times))
+
+    finish_state = {}
+
+    assert not riot_spectate.is_playback_finished(object(), settings, finish_state)
+    assert not riot_spectate.is_playback_finished(object(), settings, finish_state)
+    assert riot_spectate.is_playback_finished(object(), settings, finish_state)
+
+
+def test_is_playback_finished_resets_when_playback_moves_away_from_end(monkeypatch):
+    settings = riot_spectate.normalize_settings(
+        {
+            "request_timeout_seconds": 9,
+            "playback_finish_threshold_seconds": 1,
+            "playback_finish_confirmation_seconds": 5,
+        }
+    )
+    playback_responses = [
+        {"length": 100.0, "time": 99.5},
+        {"length": 100.0, "time": 97.0},
+        {"length": 100.0, "time": 99.5},
+        {"length": 100.0, "time": 99.6},
+    ]
+    monotonic_times = iter([10.0, 20.0, 24.0])
+
+    def fake_local_api_get(session, path, timeout_seconds):
+        assert path == "/replay/playback"
+        assert timeout_seconds == 9
+        return FakeResponse(200, playback_responses.pop(0))
+
+    monkeypatch.setattr(riot_spectate, "local_api_get", fake_local_api_get)
+    monkeypatch.setattr(riot_spectate.time, "monotonic", lambda: next(monotonic_times))
+
+    finish_state = {}
+
+    assert not riot_spectate.is_playback_finished(object(), settings, finish_state)
+    assert not riot_spectate.is_playback_finished(object(), settings, finish_state)
+    assert not riot_spectate.is_playback_finished(object(), settings, finish_state)
+    assert not riot_spectate.is_playback_finished(object(), settings, finish_state)

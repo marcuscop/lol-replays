@@ -19,6 +19,7 @@ settings:
   recording_check_interval_seconds: 5
   recording_timeout_seconds: 7200
   playback_finish_threshold_seconds: 1
+  playback_finish_confirmation_seconds: 5
   window_focus_delay_seconds: 1.0
   rune_tab_key: "c"
   rune_tab_key_hold_seconds: 0.1
@@ -27,7 +28,7 @@ settings:
   camera_hotkey_between_presses_seconds: 0.12
   recording:
     width: 1920
-    height: 1080
+    height: 1200
     frames_per_second: 60
     lossless: false
     enforce_frame_rate: false
